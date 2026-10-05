@@ -19,6 +19,10 @@ use moq_media_egui::{
     overlay::{DebugOverlay, StatCategory},
 };
 use n0_future::task::{AbortOnDropHandle, spawn};
+#[cfg(feature = "playback")]
+use n0_watcher::Watcher as _;
+#[cfg(feature = "playback")]
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -288,6 +292,8 @@ pub fn native_options(fullscreen: bool) -> eframe::NativeOptions {
 /// before the encoder sees it. The tap is replaced whenever the source is, so
 /// [`update`](Self::update) reads it fresh every frame rather than holding a
 /// receiver that a source switch would silently orphan.
+/// On macOS the camera buffer is transferred into an NV12 preview surface,
+/// since the camera's native pixel format need not be one Metal can import.
 #[derive(Debug)]
 pub struct LocalPreview {
     view: FrameView,
@@ -314,7 +320,19 @@ impl LocalPreview {
         if let Some(frames) = broadcast.preview()
             && let Some(frame) = frames.take()
         {
-            self.view.render_frame(&frame);
+            #[cfg(target_os = "macos")]
+            let prepared = match preview_surface(&frame) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    warn!(error = %err, "could not prepare the camera preview");
+                    return;
+                }
+            };
+            #[cfg(target_os = "macos")]
+            let frame = prepared.as_ref().unwrap_or(&frame);
+            #[cfg(not(target_os = "macos"))]
+            let frame = frame.as_ref();
+            self.view.render_frame(frame);
             ctx.request_repaint();
         }
     }
@@ -322,6 +340,75 @@ impl LocalPreview {
     /// Returns the image for whatever frame was drawn last.
     pub fn image(&self) -> egui::Image<'_> {
         self.view.image()
+    }
+}
+
+/// Transfer native camera buffers into the renderer's NV12 format without
+/// changing the frame shared with the outgoing encoders.
+#[cfg(target_os = "macos")]
+fn preview_surface(
+    frame: &iroh_live::media::video::Frame,
+) -> Result<Option<iroh_live::media::video::Frame>, iroh_live::media::video::Error> {
+    use iroh_live::media::video::Surface;
+
+    match &frame.surface {
+        Surface::PixelBuffer(_) => frame.resize(frame.size(), &Default::default()).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Wait for a microphone that is advertised after the first video catalog.
+/// Capture devices are opened independently, so a video-only first catalog
+/// does not mean the peer chose to send no audio.
+#[cfg(feature = "playback")]
+async fn wait_for_audio(broadcast: &RemoteBroadcast) -> bool {
+    let mut catalog = broadcast.catalog_watcher();
+    let closed = broadcast.closed();
+    tokio::pin!(closed);
+    let shutdown = broadcast.shutdown_token();
+    loop {
+        if !catalog.get().audio().is_empty() {
+            return true;
+        }
+        tokio::select! {
+            updated = catalog.updated() => {
+                if updated.is_err() {
+                    return false;
+                }
+            }
+            () = &mut closed => return false,
+            () = shutdown.cancelled() => return false,
+        }
+    }
+}
+
+#[cfg(feature = "playback")]
+#[derive(Debug)]
+struct PendingAudio {
+    rx: oneshot::Receiver<Result<AudioTrack, String>>,
+    _task: AbortOnDropHandle<()>,
+}
+
+#[cfg(feature = "playback")]
+impl PendingAudio {
+    fn new(ctx: &egui::Context, broadcast: RemoteBroadcast) -> Self {
+        let (tx, rx) = oneshot::channel();
+        let ctx = ctx.clone();
+        let task = spawn(async move {
+            if !wait_for_audio(&broadcast).await {
+                return;
+            }
+            let result = broadcast.audio().await.map_err(|err| {
+                warn!(error = %err, "audio track failed to open");
+                format!("{err:#}")
+            });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        Self {
+            rx,
+            _task: AbortOnDropHandle::new(task),
+        }
     }
 }
 
@@ -348,6 +435,10 @@ pub struct RemoteView {
     broadcast: RemoteBroadcast,
     video: Option<VideoTrackView>,
     audio: Option<AudioTrack>,
+    #[cfg(feature = "playback")]
+    pending_audio: Option<PendingAudio>,
+    #[cfg(feature = "playback")]
+    audio_error: Option<String>,
     overlay: DebugOverlay,
     signals: watch::Receiver<NetworkSignals>,
     choice: RenditionChoice,
@@ -381,10 +472,18 @@ impl RemoteView {
         let MediaTracks { video, audio } = tracks;
         let video = video.map(|track| VideoTrackView::new_wgpu(ctx, name, track, render_state));
         let decoder = DecoderArg::from_kind(&broadcast.playback_policy().decoder);
+        #[cfg(feature = "playback")]
+        let pending_audio = audio
+            .is_none()
+            .then(|| PendingAudio::new(ctx, broadcast.clone()));
         let view = Self {
             broadcast,
             video,
             audio,
+            #[cfg(feature = "playback")]
+            pending_audio,
+            #[cfg(feature = "playback")]
+            audio_error: None,
             overlay: DebugOverlay::new(&[
                 StatCategory::Net,
                 StatCategory::Render,
@@ -455,6 +554,8 @@ impl RemoteView {
     /// Returns the response of whatever was drawn, whose rect is what
     /// [`draw_overlay`](Self::draw_overlay) wants.
     pub fn draw(&mut self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
+        #[cfg(feature = "playback")]
+        self.poll_audio();
         let ctx = ui.ctx().clone();
         match self.video.as_mut() {
             Some(view) => {
@@ -463,6 +564,23 @@ impl RemoteView {
             }
             None => ui.add_sized(size, egui::Label::new("no video")),
         }
+    }
+
+    #[cfg(feature = "playback")]
+    fn poll_audio(&mut self) {
+        let Some(pending) = self.pending_audio.as_mut() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(Ok(audio)) => {
+                audio.set_volume(self.volume);
+                self.audio = Some(audio);
+            }
+            Ok(Err(err)) => self.audio_error = Some(err),
+            Err(oneshot::error::TryRecvError::Empty) => return,
+            Err(oneshot::error::TryRecvError::Closed) => {}
+        }
+        self.pending_audio = None;
     }
 
     /// Draws the stats overlay over `rect`.
@@ -547,6 +665,10 @@ impl RemoteView {
             {
                 audio.set_volume(self.volume);
             }
+        } else if let Some(error) = &self.audio_error {
+            ui.label("Audio unavailable").on_hover_text(error);
+        } else {
+            ui.label("Waiting for their microphone");
         }
     }
 
@@ -558,6 +680,10 @@ impl RemoteView {
     pub fn shutdown(&mut self) {
         self.video = None;
         self.audio = None;
+        #[cfg(feature = "playback")]
+        {
+            self.pending_audio = None;
+        }
         self.broadcast.shutdown();
     }
 }
@@ -657,6 +783,136 @@ mod tests {
     use iroh_live::{Call, ticket::LiveTicket};
 
     use super::{QR_QUIET, QrPixels};
+
+    #[cfg(feature = "playback")]
+    async fn video_only_broadcast() -> (
+        iroh_live::media::publish::LocalBroadcast,
+        iroh_live::media::subscribe::RemoteBroadcast,
+    ) {
+        use iroh_live::media::{
+            publish::LocalBroadcast, subscribe::RemoteBroadcast, test_source, video::Size,
+        };
+        let local = LocalBroadcast::new(moq_net::broadcast::Producer::new(Default::default()))
+            .expect("create the local broadcast");
+        local
+            .video()
+            .set(test_source::video(Size::new(64, 32), 30))
+            .expect("publish video");
+        let remote = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            RemoteBroadcast::new("late-audio", local.consume()),
+        )
+        .await
+        .expect("video catalog arrives")
+        .expect("open the catalog");
+        {
+            use n0_watcher::Watcher as _;
+            let mut catalog = remote.catalog_watcher();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while catalog.get().video().is_empty() {
+                    catalog.updated().await.expect("the catalog is live");
+                }
+            })
+            .await
+            .expect("the video track is advertised");
+        }
+        assert!(remote.has_video());
+        assert!(!remote.has_audio());
+        (local, remote)
+    }
+
+    /// A microphone granted permission after connection must still be heard.
+    /// This exercises the real catalog update without opening a speaker.
+    #[cfg(feature = "playback")]
+    #[tokio::test]
+    async fn a_late_audio_track_is_discovered() {
+        use iroh_live::media::{audio::Layout, test_source};
+        use std::time::Duration;
+        let (local, remote) = video_only_broadcast().await;
+        let waiting = super::wait_for_audio(&remote);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut waiting)
+                .await
+                .is_err()
+        );
+        local
+            .audio()
+            .set(test_source::audio(440.0, 48_000, Layout::Mono));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("the later audio catalog wakes the waiter")
+        );
+        remote.shutdown();
+        local.finish().await;
+    }
+
+    #[cfg(feature = "playback")]
+    #[tokio::test]
+    async fn waiting_for_audio_stops_when_the_broadcast_ends() {
+        let (local, remote) = video_only_broadcast().await;
+        local.finish().await;
+        assert!(
+            !tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::wait_for_audio(&remote),
+            )
+            .await
+            .expect("a closed peer does not leave an audio task waiting")
+        );
+    }
+
+    #[cfg(feature = "playback")]
+    #[tokio::test]
+    async fn waiting_for_audio_stops_when_the_view_shuts_down() {
+        let (local, remote) = video_only_broadcast().await;
+        remote.shutdown();
+        assert!(!super::wait_for_audio(&remote).await);
+        local.finish().await;
+    }
+
+    /// A native preview can be converted independently while the original
+    /// frame remains available to the outgoing encoder.
+    #[cfg(all(target_os = "macos", feature = "playback"))]
+    #[tokio::test]
+    async fn a_native_preview_preserves_the_shared_frame() {
+        use iroh_live::media::video::Surface;
+        let (local, remote) = video_only_broadcast().await;
+        remote.set_playback_policy(remote.playback_policy().with_gpu_frames(true));
+        let video = remote.video().await.expect("open the video track");
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), video.recv())
+            .await
+            .expect("a decoded frame arrives")
+            .expect("the video is live");
+        assert!(
+            matches!(&frame.surface, Surface::PixelBuffer(_)),
+            "exercise the native macOS path"
+        );
+        let before = frame
+            .surface
+            .to_i420()
+            .expect("read the original pixels")
+            .into_owned();
+        let preview = super::preview_surface(&frame)
+            .expect("prepare the native preview")
+            .expect("native frames get a separate preview surface");
+        assert_eq!(preview.size(), frame.size());
+        assert_eq!(preview.timestamp, frame.timestamp);
+        let after = preview.surface.to_i420().expect("read the preview pixels");
+        assert_eq!(before.data(), after.data());
+        assert_eq!(
+            before.data(),
+            frame
+                .surface
+                .to_i420()
+                .expect("the original remains readable")
+                .data()
+        );
+        remote.shutdown();
+        drop(video);
+        local.finish().await;
+    }
 
     /// Pixels per module in the upscaled test image.
     ///

@@ -4474,6 +4474,7 @@ dependencies = [
  "moq-net",
  "n0-error",
  "n0-future",
+ "n0-watcher",
  "qr2term",
  "qrcode",
  "rqrr",

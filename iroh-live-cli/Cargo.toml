@@ -25,6 +25,7 @@ moq-media-egui = { workspace = true, optional = true }
 moq-mux = { workspace = true }
 n0-error = { version = "1", features = ["anyhow"] }
 n0-future = "0.3.2"
+n0-watcher = "1"
 qr2term = "0.3"
 # QR encoding for the ticket a call window shows its peer, and for the codes the
 # scan tests decode. Only the encoder itself is wanted: the default features
@@ -72,4 +73,3 @@ qlog = ["iroh/qlog"]
 
 [lints]
 workspace = true
-
