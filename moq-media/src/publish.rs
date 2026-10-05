@@ -592,7 +592,7 @@ fn spawn_audio(
                 publication_options.clock = clock;
                 let publication =
                     moq_audio::encode::Publication::new(broadcast, catalog, publication_options);
-                let (publication, driver) = match publication {
+                let (mut publication, driver) = match publication {
                     Ok(publication) => publication,
                     Err(err) => {
                         warn!(error = %err, "audio publish stopped");
@@ -601,12 +601,37 @@ fn spawn_audio(
                 };
                 let publish = driver.run();
                 tokio::pin!(publish);
-                let result = tokio::select! {
-                    result = &mut publish => result,
-                    _ = shutdown.cancelled() => {
-                        drop(publication);
-                        publish.await
-                    },
+                let result = loop {
+                    tokio::select! {
+                        result = &mut publish => break result,
+                        state = publication.changed() => {
+                            let Some(state) = state else {
+                                break publish.await;
+                            };
+                            // A retained publication can park on a permanent
+                            // input failure rather than returning from run().
+                            // Report that state while the call is still alive.
+                            if let Some(err) = state.failure() {
+                                warn!(
+                                    source = ?state.source(),
+                                    device = ?state.device(),
+                                    error = %err,
+                                    "audio capture failed"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    status = ?state.status(),
+                                    source = ?state.source(),
+                                    device = ?state.device(),
+                                    "audio capture state changed"
+                                );
+                            }
+                        }
+                        _ = shutdown.cancelled() => {
+                            drop(publication);
+                            break publish.await;
+                        },
+                    }
                 };
                 if let Err(err) = result {
                     warn!(error = %err, "audio publish stopped");

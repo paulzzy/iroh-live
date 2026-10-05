@@ -1,0 +1,81 @@
+name: Windows runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/windows-runtime-tests']
+  pull_request:
+    paths:
+      - '.github/workflows/windows-runtime.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'iroh-live/**'
+      - 'iroh-live-cli/**'
+      - 'moq-media/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  runtime:
+    name: Windows tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-runtime-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint the Windows release feature set
+        run: cargo clippy --locked -p iroh-live-cli -p iroh-live -p moq-media --all-targets --features iroh-live-cli/aec,moq-media/test-source -- -D warnings
+      - name: CLI and media regression tests
+        run: cargo test --locked -p iroh-live-cli -p iroh-live -p moq-media --lib --bins --features iroh-live-cli/aec,moq-media/test-source -- --test-threads=2
+      - name: Failed microphone startup must be reported
+        run: cargo test --locked -p moq-media --test capture_diagnostics --features capture -- --nocapture
+      - name: Audio and video over QUIC, including simultaneous two-way media
+        run: cargo test --locked -p iroh-live --test e2e -- --nocapture --test-threads=1
+      - name: Build a Windows diagnostic binary
+        run: cargo build --locked --profile release-dist -p iroh-live-cli --features aec
+      - name: Enumerate runner devices
+        shell: pwsh
+        run: |
+          $env:RUST_LOG = 'info,moq_media=debug,moq_audio=debug'
+          & .\target\release-dist\irl.exe devices 2>&1 | Tee-Object -FilePath runner-devices.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload diagnostic binary and device inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: irl-diagnostics-${{ matrix.os }}
+          path: |
+            target/release-dist/irl.exe
+            runner-devices.txt
+          if-no-files-found: error

@@ -27,6 +27,12 @@ async fn endpoint() -> Endpoint {
     static LOOKUP: OnceLock<MemoryLookup> = OnceLock::new();
     let lookup = LOOKUP.get_or_init(MemoryLookup::new);
     let endpoint = Endpoint::builder(presets::Minimal)
+        // Explicit loopback addresses are available immediately. A wildcard
+        // bind relies on asynchronous interface discovery, so registering its
+        // first addr() snapshot can leave the lookup with no dialable address.
+        .clear_ip_transports()
+        .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("configure loopback transport")
         .address_lookup(lookup.clone())
         .bind()
         .await
@@ -158,6 +164,138 @@ async fn publish_subscribe_audio() {
 
     publisher.shutdown().await;
     subscriber.shutdown().await;
+}
+
+/// Both peers publish and receive at once, without a camera, microphone,
+/// speaker, or window. Distinct sizes and tones prove each receives its peer's
+/// media, including audible PCM rather than merely nonempty packets.
+#[tokio::test]
+#[traced_test]
+async fn simultaneous_two_way_audio_and_video() {
+    let left = Live::builder(endpoint().await).with_router().spawn();
+    let right = Live::builder(endpoint().await).with_router().spawn();
+    let left_broadcast = left.publish("left").expect("publish left");
+    let right_broadcast = right.publish("right").expect("publish right");
+    let left_size = Size::new(160, 96);
+    let right_size = Size::new(192, 128);
+    for (broadcast, size, tone) in [
+        (&left_broadcast, left_size, 440.0),
+        (&right_broadcast, right_size, 880.0),
+    ] {
+        broadcast
+            .video()
+            .set(test_source::video(size, 30))
+            .expect("publish generated video");
+        broadcast.audio().set(test_source::audio(
+            tone,
+            48_000,
+            moq_media::audio::Layout::Mono,
+        ));
+    }
+
+    let (at_left, at_right) = tokio::join!(
+        left.subscribe(right.endpoint().addr(), "right"),
+        right.subscribe(left.endpoint().addr(), "left"),
+    );
+    let at_left = at_left.expect("left subscribes to right");
+    let at_right = at_right.expect("right subscribes to left");
+    tokio::time::timeout(TIMEOUT, async {
+        tokio::join!(
+            verify_generated_media(at_left.broadcast(), right_size, 880.0),
+            verify_generated_media(at_right.broadcast(), left_size, 440.0),
+        );
+    })
+    .await
+    .expect("both peers receive audio and video while publishing their own");
+
+    drop(at_left);
+    drop(at_right);
+    left_broadcast.finish().await;
+    right_broadcast.finish().await;
+    tokio::join!(left.shutdown(), right.shutdown());
+}
+
+async fn verify_generated_media(
+    remote: &moq_media::subscribe::RemoteBroadcast,
+    size: Size,
+    tone: f32,
+) {
+    use n0_watcher::Watcher as _;
+
+    let mut catalog = remote.catalog_watcher();
+    while catalog.get().audio().is_empty() || catalog.get().video().is_empty() {
+        catalog.updated().await.expect("catalog remains live");
+    }
+
+    let video = async {
+        let track = remote.video().await.expect("open peer video");
+        let mut previous = None;
+        for _ in 0..5 {
+            let frame = track.recv().await.expect("peer video frame");
+            assert_eq!(frame.size(), size, "receive the peer's video dimensions");
+            if let Some(previous) = previous {
+                assert!(frame.timestamp > previous, "video timestamps advance");
+            }
+            previous = Some(frame.timestamp);
+            assert!(
+                !frame
+                    .surface
+                    .to_i420()
+                    .expect("read decoded pixels")
+                    .data()
+                    .is_empty(),
+                "decoded video contains pixels",
+            );
+        }
+    };
+    let audio = async {
+        let snapshot = catalog.get();
+        let name = snapshot.first_audio().expect("audio is advertised");
+        let mut options = moq_media::audio::decode::Options::new();
+        options.output.format = moq_media::audio::Format::F32;
+        let mut track = moq_media::audio::decode::Consumer::new(
+            remote.consumer(),
+            &snapshot.audio()[name],
+            name,
+            options,
+        )
+        .await
+        .expect("open peer audio decoder");
+        assert_eq!(track.sample_rate(), 48_000);
+        assert_eq!(track.layout(), moq_media::audio::Layout::Mono);
+        let mut samples = Vec::new();
+        let mut previous = None;
+        while samples.len() < 9_600 {
+            let frame = track
+                .read()
+                .await
+                .expect("decode audio")
+                .expect("peer audio frame");
+            if let Some(previous) = previous {
+                assert!(frame.timestamp > previous, "audio timestamps advance");
+            }
+            previous = Some(frame.timestamp);
+            for sample in frame.data.as_chunks::<4>().0 {
+                let sample = f32::from_le_bytes(*sample);
+                assert!(sample.is_finite(), "decoded PCM is finite");
+                samples.push(sample);
+            }
+        }
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+            / samples.len() as f32)
+            .sqrt();
+        assert!(rms > 0.05, "peer's audio is audible, RMS {rms}");
+        let crossings = samples
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let measured = crossings as f32 * 48_000.0 / samples.len() as f32;
+        assert!(
+            (measured - tone).abs() < tone * 0.1,
+            "receive the peer's {tone} Hz tone, measured {measured} Hz",
+        );
+    };
+    tokio::join!(video, audio);
 }
 
 /// Publishes two renditions and drives the subscriber's adaptation with
