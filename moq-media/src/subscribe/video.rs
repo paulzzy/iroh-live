@@ -686,17 +686,35 @@ async fn deliver(
     rate: &crate::stats::Rate,
 ) {
     let pts = Duration::from_micros(frame.timestamp.as_micros() as u64);
+    let started = Instant::now();
     // The metric smooths whatever value it is handed, so it wants the
     // instantaneous rate, not a tick. Timed at arrival rather than from the
     // presentation timestamps, because a stall shows up here and not there.
-    if let Some(rate) = rate.tick() {
-        context.stats.render.fps.record(rate);
+    let fps = rate.tick();
+    if let Some(fps) = fps {
+        context.stats.render.fps.record(fps);
     }
     if synced {
         context.sync.received(pts);
         if !context.sync.wait_async(pts).await {
             return;
         }
+    }
+    let held = started.elapsed();
+    context.stats.timing.playout_hold_ms.record_ms(held);
+    if let Some(delta) = context.sync.av_delta_ms(pts) {
+        context.stats.timing.av_delta_ms.record(delta);
+    }
+    // Rate::tick reports once per second, so the same event bounds diagnostic
+    // logging without adding a timer or another frame-rate counter.
+    if fps.is_some() {
+        debug!(
+            pts_ms = pts.as_millis() as u64,
+            hold_ms = held.as_secs_f64() * 1000.0,
+            sync_latency_ms = context.sync.latency().as_millis() as u64,
+            av_delta_ms = ?context.sync.av_delta_ms(pts),
+            "video playout timing",
+        );
     }
     frames.send(frame);
 }

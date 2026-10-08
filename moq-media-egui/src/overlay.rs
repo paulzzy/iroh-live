@@ -421,6 +421,7 @@ fn detail_entries<'a>(cat: StatCategory, stats: &'a SubscribeStats) -> Vec<Detai
             push_metric(&mut entries, &stats.timing.video_lag_ms);
             push_metric(&mut entries, &stats.timing.audio_lag_ms);
             push_metric(&mut entries, &stats.timing.av_delta_ms);
+            push_metric(&mut entries, &stats.timing.playout_hold_ms);
             push_metric(&mut entries, &stats.timing.video_buf);
         }
     }
@@ -1021,14 +1022,25 @@ impl DebugOverlay {
                 }
             }
             let buf_ms = timing.audio_buf_ms.current();
-            let color = if buf_ms > 40.0 {
+            let color = if !timing.audio_buf_ms.has_samples() {
+                egui::Color32::GRAY
+            } else if buf_ms > 200.0 {
+                COLOR_RED
+            } else if buf_ms > 80.0 {
+                COLOR_YELLOW
+            } else if buf_ms > 40.0 {
                 COLOR_GREEN
             } else if buf_ms > 15.0 {
                 COLOR_YELLOW
             } else {
                 COLOR_RED
             };
-            let g = painter.layout_no_wrap(format!("AudioBuf {buf_ms:.0}ms"), font.clone(), color);
+            let label = if timing.audio_buf_ms.has_samples() {
+                format!("AudioBuf {buf_ms:.0}ms")
+            } else {
+                "AudioBuf unavailable".to_string()
+            };
+            let g = painter.layout_no_wrap(label, font.clone(), color);
             painter.galley(delay_rect.min + egui::vec2(4.0, 2.0), g, color);
         }
 

@@ -97,6 +97,10 @@ struct SyncState {
     /// together.
     audio_ms: Option<i64>,
 
+    /// Last accepted audio endpoint and its queued duration. Used for timing
+    /// diagnostics; it does not change the existing playout policy.
+    audio_position: Option<AudioPosition>,
+
     /// The video path's own decode latency, if a caller measured one. Nothing
     /// in this crate does, so it is unset in practice.
     video_ms: Option<i64>,
@@ -108,6 +112,24 @@ struct SyncState {
 
     /// Set by [`Sync::close`], which makes every wait return immediately.
     closed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AudioPosition {
+    end: Duration,
+    buffered: Duration,
+    observed: Instant,
+}
+
+impl AudioPosition {
+    fn at(self, now: Instant) -> Duration {
+        // Once the queue empties, hold at its final media timestamp rather
+        // than inventing audio that was never written to the device.
+        let queued = self
+            .buffered
+            .saturating_sub(now.saturating_duration_since(self.observed));
+        self.end.saturating_sub(queued)
+    }
 }
 
 impl Sync {
@@ -126,6 +148,7 @@ impl Sync {
                     reference: None,
                     jitter_ms,
                     audio_ms: None,
+                    audio_position: None,
                     video_ms: None,
                     latency_ms: jitter_ms,
                     closed: false,
@@ -242,6 +265,33 @@ impl Sync {
         self.inner.changed.notify_waiters();
     }
 
+    /// Records the endpoint of PCM accepted by the speaker sink and how much
+    /// remains queued, for measuring A/V offset on the shared media timeline.
+    ///
+    /// `end` includes only accepted samples, not an overflowing packet's
+    /// discarded tail. This observation does not change video scheduling.
+    pub fn record_audio_position(&self, end: Duration, buffered: Duration) {
+        self.inner.state.lock().expect("poisoned").audio_position = Some(AudioPosition {
+            end,
+            buffered,
+            observed: Instant::now(),
+        });
+    }
+
+    /// Estimates the rendered video's offset from audio currently leaving the
+    /// sink, in milliseconds. Positive means video is behind audio.
+    ///
+    /// Returns `None` before audio is observed or after shutdown. The estimate
+    /// excludes additional latency inside an OS or external output device.
+    pub fn av_delta_ms(&self, video_pts: Duration) -> Option<f64> {
+        let state = self.inner.state.lock().expect("poisoned");
+        if state.closed {
+            return None;
+        }
+        let audio_pts = state.audio_position?.at(Instant::now());
+        Some((audio_pts.as_secs_f64() - video_pts.as_secs_f64()) * 1000.0)
+    }
+
     /// Sets the video path's own decode latency.
     ///
     /// The counterpart of [`set_audio_buffered`](Self::set_audio_buffered) for
@@ -293,6 +343,45 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    /// A stalled video path is visible even though frames keep arriving at
+    /// their ordinary cadence: the comparison uses audio's media position.
+    #[test]
+    fn audio_position_exposes_a_stale_video_frame() {
+        let sync = Sync::new();
+        assert!(sync.av_delta_ms(Duration::ZERO).is_none());
+        sync.record_audio_position(Duration::from_millis(3100), Duration::from_millis(100));
+        let stale = sync
+            .av_delta_ms(Duration::from_secs(1))
+            .expect("audio is observed");
+        assert!((2000.0..=2100.0).contains(&stale), "stale video: {stale}ms");
+        let fresh = sync
+            .av_delta_ms(Duration::from_secs(3))
+            .expect("audio is observed");
+        assert!((0.0..=100.0).contains(&fresh), "fresh video: {fresh}ms");
+        sync.close();
+        assert!(sync.av_delta_ms(Duration::ZERO).is_none());
+    }
+
+    /// Silence after an underrun must not look like an ever-growing video lag.
+    #[test]
+    fn audio_position_stops_at_the_last_accepted_sample() {
+        let now = Instant::now();
+        let position = AudioPosition {
+            end: Duration::from_secs(5),
+            buffered: Duration::from_millis(100),
+            observed: now,
+        };
+        assert_eq!(position.at(now), Duration::from_millis(4900));
+        assert_eq!(
+            position.at(now + Duration::from_millis(50)),
+            Duration::from_millis(4950)
+        );
+        assert_eq!(
+            position.at(now + Duration::from_secs(3)),
+            Duration::from_secs(5)
+        );
+    }
 
     #[test]
     fn received_tracks_minimum_reference() {

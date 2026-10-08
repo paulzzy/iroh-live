@@ -99,11 +99,17 @@ same way a rendition switch does, so the picture stays up across it.
 ## Reading the timing metrics
 
 `moq_media::stats::TimingStats` defines the timing panel the egui overlay draws.
-`audio_buf_ms` is the sink's fill level, `video_lag_ms` and `audio_lag_ms` are
-wall-clock drift from each path's PTS cadence, and `av_delta_ms` is
-`video_lag - audio_lag`, positive when video trails audio.
+`audio_buf_ms` is the measured sink fill level after each write.
+`playout_hold_ms` is the time decoded video waits before being released to the
+renderer. `av_delta_ms` compares that video's PTS with the estimated audible
+audio PTS: the endpoint of samples actually accepted by the sink minus its
+queued duration. Positive means video trails audio. The audio position advances
+only as far as its last accepted endpoint, so an underrun does not invent media.
+These are diagnostics; the audio PTS estimate does not change video scheduling.
+OS/device output latency and compositor latency are outside this measurement.
 
-Nothing in this repository writes those four today. `LagTracker` exists and is
-unused, and the audio and video decode paths record only `render.fps`. The
-overlay draws whatever it finds, so the timing panel reads zero until something
-fills it in. See [developer tools](devtools.md).
+`video_lag_ms`, `audio_lag_ms`, `video_buf`, and `Timeline` still have no producer.
+The timeline's ten-second horizontal axis is a history window, not a latency
+reading. Missing audio-buffer measurements are shown as unavailable. With
+`RUST_LOG=moq_media=debug`, audio and video playout timing is logged once per
+second. See [developer tools](devtools.md).

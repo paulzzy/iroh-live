@@ -32,12 +32,28 @@ and `encode.bitrate_kbps`. `iroh-live`'s `util::spawn_stats_recorder` fills
 `NetStats` from the iroh connection's selected path every 200 ms. The egui overlay
 sets `render.rendition` from the track.
 
-Everything else is defined and unwritten. `TimingStats`, `Timeline`, and
-`LagTracker` have no producer in this repository, so the timing panel and the
-timeline read zero. `render.decode_ms` is never recorded, and `render.fps` is
-recorded as the constant `1.0` rather than a measured rate, so it reports 1.0
-rather than a frame rate. Wiring those back up is outstanding work, not a
-configuration step.
+The video path records measured FPS and the combined transport-read/decode
+duration. Audio playback records the real sink fill level. Video delivery records
+its playout hold and the offset from estimated audible audio PTS; positive A/V
+offset means video is behind audio. Timing debug logs appear once per second
+under `RUST_LOG=moq_media=debug`. These measurements exclude device and compositor
+latency and are not a cross-machine capture-to-display measurement.
+
+The per-path lag fields, decoded-frame queue field, and `Timeline` still have no
+producer. The timeline's −10s axis is history, not measured delay; an unobserved
+audio buffer is labelled unavailable rather than zero.
+
+The Desktop runtime workflow builds the same source and locked dependencies on
+Windows 2022, Windows 2025, macOS 14, and macOS 26. Rust is pinned to 1.99.0 and
+the macOS deployment target to 14.0. Artifacts include the executable, runner
+device inventory, SHA256SUMS, and build-info.json with the commit, compiler,
+lockfile hash, runner image, and SDK. Apple silicon artifacts also include a
+tarball that preserves executable permissions. This makes inputs traceable and
+builds repeatable; runner images and SDKs can still change between runs.
+
+The workflow runs the latency suite, including a three-second viewer pause that
+must resume on a recent frame. Tests use generated media and real QUIC; physical
+camera, microphone, speaker, and display behaviour still need device checks.
 
 ## The debug overlay
 

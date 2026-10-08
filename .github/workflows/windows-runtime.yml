@@ -1,4 +1,4 @@
-name: Windows runtime
+name: Desktop runtime
 
 on:
   workflow_dispatch:
@@ -7,11 +7,13 @@ on:
   pull_request:
     paths:
       - '.github/workflows/windows-runtime.yml'
+      - '.github/scripts/desktop-build-manifest.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'iroh-live/**'
       - 'iroh-live-cli/**'
       - 'moq-media/**'
+      - 'moq-media-egui/**'
 
 permissions:
   contents: read
@@ -27,20 +29,38 @@ env:
 
 jobs:
   runtime:
-    name: Windows tests (${{ matrix.os }})
+    name: Desktop tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025]
+        include:
+          - os: windows-2022
+            bin: irl.exe
+            asset: irl-windows-x86_64.exe
+          - os: windows-2025
+            bin: irl.exe
+            asset: irl-windows-x86_64.exe
+          - os: macos-14
+            bin: irl
+            asset: irl-macos-aarch64
+          - os: macos-26
+            bin: irl
+            asset: irl-macos-aarch64
+    env:
+      # Match the upstream Apple silicon release's minimum supported version.
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          toolchain: stable
+          toolchain: '1.99.0'
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -48,34 +68,53 @@ jobs:
           cache-on-failure: true
 
       - name: Install NASM
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           choco install nasm --no-progress -y
           "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install libtool automake
+
       - name: Check formatting
         run: cargo fmt --all --check
-      - name: Lint the Windows release feature set
-        run: cargo clippy --locked -p iroh-live-cli -p iroh-live -p moq-media --all-targets --features iroh-live-cli/aec,moq-media/test-source -- -D warnings
+      - name: Lint the desktop release feature set
+        run: cargo clippy --locked -p iroh-live-cli -p iroh-live -p moq-media -p moq-media-egui --all-targets --features iroh-live-cli/aec,moq-media/test-source -- -D warnings
       - name: CLI and media regression tests
         run: cargo test --locked -p iroh-live-cli -p iroh-live -p moq-media --lib --bins --features iroh-live-cli/aec,moq-media/test-source -- --test-threads=2
       - name: Failed microphone startup must be reported
         run: cargo test --locked -p moq-media --test capture_diagnostics --features capture -- --nocapture
       - name: Audio and video over QUIC, including simultaneous two-way media
         run: cargo test --locked -p iroh-live --test e2e -- --nocapture --test-threads=1
-      - name: Build a Windows diagnostic binary
+      - name: Measure pipeline delay and recovery after a viewer pause
+        run: cargo test --locked -p iroh-live --test latency -- --nocapture --test-threads=1
+      - name: Build a desktop diagnostic binary
         run: cargo build --locked --profile release-dist -p iroh-live-cli --features aec
       - name: Enumerate runner devices
-        shell: pwsh
+        env:
+          RUST_LOG: info,moq_media=debug,moq_audio=debug
+          IRL_BINARY: target/release-dist/${{ matrix.bin }}
         run: |
-          $env:RUST_LOG = 'info,moq_media=debug,moq_audio=debug'
-          & .\target\release-dist\irl.exe devices 2>&1 | Tee-Object -FilePath runner-devices.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Upload diagnostic binary and device inventory
+          set -euo pipefail
+          "$IRL_BINARY" devices 2>&1 | tee runner-devices.txt
+      - name: Package binary with build provenance and checksums
+        env:
+          IRL_BINARY: target/release-dist/${{ matrix.bin }}
+          IRL_ASSET: ${{ matrix.asset }}
+          IRL_RUNNER: ${{ matrix.os }}
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            python3 .github/scripts/desktop-build-manifest.py "$IRL_BINARY" "$IRL_ASSET" "$IRL_RUNNER"
+          else
+            python .github/scripts/desktop-build-manifest.py "$IRL_BINARY" "$IRL_ASSET" "$IRL_RUNNER"
+          fi
+      - name: Upload diagnostic binary, provenance, and device inventory
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: irl-diagnostics-${{ matrix.os }}
           path: |
-            target/release-dist/irl.exe
+            desktop-dist/*
             runner-devices.txt
           if-no-files-found: error

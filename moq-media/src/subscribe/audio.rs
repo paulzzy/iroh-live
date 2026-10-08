@@ -7,6 +7,7 @@
 
 use n0_error::{Result, e};
 use n0_future::task::{AbortOnDropHandle, spawn};
+use std::time::{Duration, Instant};
 use tracing::{Instrument, debug, error_span, info, warn};
 
 use super::{AudioTrack, RemoteBroadcast, SubscribeError, audio_decode_config};
@@ -43,6 +44,7 @@ pub(super) async fn open(
 
     let task = spawn(
         async move {
+            let mut reported = Instant::now();
             // `consumer.read()` sits in a `select!`, which the video side goes
             // out of its way to avoid. It is safe here because the audio
             // consumer reads through a poll function whose state lives in
@@ -61,9 +63,30 @@ pub(super) async fn open(
                             // still buffered ahead of the speaker, which is the
                             // only latency either side can actually measure.
                             context.sync.set_audio_buffered(Some(sink.buffered()));
-                            if let Err(err) = sink.write(&frame.data) {
-                                warn!(error = %err, "audio sink write failed");
-                                return;
+                            let written = match sink.write(&frame.data) {
+                                Ok(written) => written,
+                                Err(err) => {
+                                    warn!(error = %err, "audio sink write failed");
+                                    return;
+                                }
+                            };
+                            let buffered = sink.buffered();
+                            context.stats.timing.audio_buf_ms.record_ms(buffered);
+                            if written.accepted_sample_frames > 0 {
+                                let start = Duration::from_micros(frame.timestamp.as_micros() as u64);
+                                let accepted = Duration::from_secs_f64(
+                                    written.accepted_sample_frames as f64 / f64::from(sink.input().sample_rate),
+                                );
+                                context.sync.record_audio_position(start + accepted, buffered);
+                            }
+                            if reported.elapsed() >= Duration::from_secs(1) {
+                                debug!(
+                                    pts_ms = (frame.timestamp.as_micros() / 1000) as u64,
+                                    buffered_ms = buffered.as_secs_f64() * 1000.0,
+                                    dropped_samples = written.dropped_sample_frames,
+                                    "audio playout timing",
+                                );
+                                reported = Instant::now();
                             }
                         }
                         Ok(None) => {

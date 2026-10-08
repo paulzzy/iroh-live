@@ -42,6 +42,9 @@ async fn endpoint() -> Endpoint {
     static LOOKUP: OnceLock<MemoryLookup> = OnceLock::new();
     let lookup = LOOKUP.get_or_init(MemoryLookup::new);
     let endpoint = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("configure loopback transport")
         .address_lookup(lookup.clone())
         .bind()
         .await
@@ -174,4 +177,50 @@ async fn pipeline_latency_with_the_default_playout_hold() {
         "the default playout policy took {median:?} median on loopback, far past its own \
          jitter buffer"
     );
+}
+
+/// A viewer that stops drawing for seconds must resume with a recent frame,
+/// rather than work through a queue at the stream's normal frame rate.
+#[tokio::test]
+#[traced_test]
+async fn a_paused_viewer_resumes_with_recent_video() {
+    let handed: Handed = Arc::default();
+    let publisher = Live::builder(endpoint().await).with_router().spawn();
+    let broadcast = publisher.publish("resume-latency").expect("publish");
+    broadcast
+        .video()
+        .set(stamped_source(handed.clone()))
+        .expect("set video");
+    let subscriber = Live::builder(endpoint().await).spawn();
+    let sub = subscriber
+        .subscribe(publisher.endpoint().addr(), "resume-latency")
+        .await
+        .expect("subscribe");
+    sub.broadcast()
+        .set_playback_policy(PlaybackPolicy::default().with_decoder(decode::Kind::Software));
+    let track = sub.broadcast().video().await.expect("open video");
+    tokio::time::timeout(TIMEOUT, track.recv())
+        .await
+        .expect("first frame arrives")
+        .expect("video is live");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let frame = tokio::time::timeout(TIMEOUT, track.recv())
+        .await
+        .expect("resume promptly")
+        .expect("video stays live");
+    let rendered = Instant::now();
+    let handed_at = handed.lock().expect("poisoned")[&frame.timestamp.as_micros()];
+    let age = rendered.duration_since(handed_at);
+    assert!(
+        age < Duration::from_secs(1),
+        "resumed video is {age:?} old after a 3s viewer pause"
+    );
+    assert!(sub.broadcast().stats().timing.playout_hold_ms.has_samples());
+
+    drop(track);
+    drop(sub);
+    subscriber.shutdown().await;
+    drop(broadcast);
+    publisher.shutdown().await;
 }

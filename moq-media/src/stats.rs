@@ -440,8 +440,11 @@ pub struct TimingStats {
     pub video_lag_ms: Metric,
     /// Audio playout lag: wall drift from PTS cadence.
     pub audio_lag_ms: Metric,
-    /// A/V delta: `video_lag - audio_lag`. Positive = video behind audio.
+    /// Video released to the renderer relative to estimated audible audio
+    /// PTS. Positive = video behind audio. Excludes OS/device output latency.
     pub av_delta_ms: Metric,
+    /// Time a decoded video frame waited in the playout supervisor.
+    pub playout_hold_ms: Metric,
     /// Decoded video frames waiting in the playout buffer.
     pub video_buf: Metric,
 }
@@ -461,6 +464,7 @@ impl Default for TimingStats {
             av_delta_ms: Metric::new(
                 MetricMeta::responsive("A/V delta", "ms").with_thresholds(20.0, 50.0, false),
             ),
+            playout_hold_ms: Metric::new(MetricMeta::responsive("Hold", "ms")),
             video_buf: Metric::new(MetricMeta::responsive("VideoBuf", "")),
         }
     }
@@ -545,8 +549,8 @@ pub struct SubscribeStats {
     pub net: NetStats,
     /// Written by the video decode path.
     pub render: RenderStats,
-    /// Written by whatever paces playout. Nothing in this crate does yet, so
-    /// these read empty on a plain subscription.
+    /// Audio buffer, video hold, and A/V offset are written by playback.
+    /// The remaining timing fields have no producer yet.
     pub timing: TimingStats,
     /// Written by whatever paces playout, alongside [`SubscribeStats::timing`].
     pub timeline: Timeline,
