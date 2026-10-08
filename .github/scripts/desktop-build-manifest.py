@@ -56,11 +56,12 @@ def main():
         manifest["macos_sdk"] = command("xcrun", "--sdk", "macosx", "--show-sdk-version")
         manifest["macos_deployment_target"] = os.environ["MACOSX_DEPLOYMENT_TARGET"]
     info = dist / "build-info.json"
-    info.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    info.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
     checksums = dist / "SHA256SUMS"
     checksums.write_text(
         "".join(f"{digest(path)}  {path.name}\n" for path in (asset, info)),
         encoding="utf-8",
+        newline="\n",
     )
 
     # upload-artifact does not preserve Unix executable permissions. A tarball

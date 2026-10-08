@@ -8,6 +8,7 @@ on:
     paths:
       - '.github/workflows/windows-runtime.yml'
       - '.github/scripts/desktop-build-manifest.py'
+      - '.gitattributes'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'iroh-live/**'
@@ -109,6 +110,14 @@ jobs:
             python3 .github/scripts/desktop-build-manifest.py "$IRL_BINARY" "$IRL_ASSET" "$IRL_RUNNER"
           else
             python .github/scripts/desktop-build-manifest.py "$IRL_BINARY" "$IRL_ASSET" "$IRL_RUNNER"
+          fi
+      - name: Verify packaged checksums
+        working-directory: desktop-dist
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 -c SHA256SUMS
+          else
+            sha256sum -c SHA256SUMS
           fi
       - name: Upload diagnostic binary, provenance, and device inventory
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
